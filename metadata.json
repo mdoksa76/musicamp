@@ -2,13 +2,15 @@
     "uuid": "musicamp@mdoksa76.github.com",
     "name": "MusicAMP Player",
     "description": "Music player with playlist support.",
-    "version": 1,
+    "version": 2,
     "shell-version": [
         "45",
-        "46", 
+        "46",
         "47",
         "48",
-        "49"
+        "49",
+        "50"
     ],
     "url": "https://github.com/mdoksa76/musicamp",
+    "settings-schema": "org.gnome.shell.extensions.musicamp"
 }

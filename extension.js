@@ -32,6 +32,7 @@ class MusicPlayer {
         this.duration = 0;
         this.position = 0;
         this.progressUpdateId = null;
+        this._pendingTimeouts = [];
         
         this._initPlayer();
         this._loadPlaylist();
@@ -53,11 +54,34 @@ class MusicPlayer {
         
         let bus = this.player.get_bus();
         bus.add_signal_watch();
-        bus.connect('message', (bus, message) => {
-            if (message.type === Gst.MessageType.EOS) {
-                this._onTrackEnded();
-            } else if (message.type === Gst.MessageType.DURATION_CHANGED) {
-                this._updateDuration();
+        this._bus = bus;
+        this._busSignalId = bus.connect('message', (bus, message) => {
+            switch (message.type) {
+                case Gst.MessageType.EOS:
+                    console.debug('🎵 GStreamer EOS received');
+                    this._onTrackEnded();
+                    break;
+                    
+                case Gst.MessageType.ERROR:
+                    let [err, debug] = message.parse_error();
+                    console.error(`🎵 GStreamer error: ${err.message} (${debug})`);
+                    this._onTrackEnded(); // Na grešku, pokreni sljedeću pjesmu
+                    break;
+                    
+                case Gst.MessageType.STATE_CHANGED:
+                    if (message.src === this.player) {
+                        let [old, newState, pending] = message.parse_state_changed();
+                        // Ako se vratimo na NULL stanje (kraj pjesme)
+                        if (newState === Gst.State.NULL && old === Gst.State.PLAYING) {
+                            console.debug('🎵 GStreamer state changed to NULL from PLAYING');
+                            this._onTrackEnded();
+                        }
+                    }
+                    break;
+                    
+                case Gst.MessageType.DURATION_CHANGED:
+                    this._updateDuration();
+                    break;
             }
         });
         
@@ -139,6 +163,13 @@ class MusicPlayer {
                 return GLib.SOURCE_CONTINUE;
             }
             
+            // Provjeri da li je pjesma završila (manualna detekcija)
+            if (this.duration > 0 && this.position >= this.duration - 0.5) {
+                console.debug('🎵 Manual track end detection');
+                this._onTrackEnded();
+                return GLib.SOURCE_CONTINUE;
+            }
+            
             let [success, position] = this.player.query_position(Gst.Format.TIME);
             if (success) {
                 this.position = position / Gst.SECOND;
@@ -173,14 +204,28 @@ class MusicPlayer {
     }
     
     _onTrackEnded() {
-        console.debug('🎵 Track ended');
+        console.debug('🎵 Track ended, moving to next track');
         this._stopProgressUpdates();
         
-        if (this.loopEnabled) {
-            this.next();
-        } else {
-            this.stop();
+        if (this.player) {
+            this.player.set_state(Gst.State.NULL);
         }
+        
+        this.isPlaying = false;
+        
+        // Kratki delay prije sljedeće pjesme
+        let timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+            this._pendingTimeouts = this._pendingTimeouts.filter(id => id !== timeoutId);
+            if (this.loopEnabled) {
+                this.next();
+            } else {
+                this.stop();
+                // Ipak pokreni sljedeću za kontinuirani playback
+                this.next();
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+        this._pendingTimeouts.push(timeoutId);
     }
     
     play() {
@@ -189,6 +234,7 @@ class MusicPlayer {
             return;
         }
         
+        // Ako već svira, samo nastavi
         if (this.isPlaying) {
             this.player.set_state(Gst.State.PLAYING);
             this._startProgressUpdates();
@@ -206,13 +252,34 @@ class MusicPlayer {
             track = this.playlist[this.currentTrack];
         }
         
-        console.debug(`🎵 Playing: ${track.name}`);
-        this.player.set_property('uri', track.uri);
-        this.player.set_state(Gst.State.PLAYING);
-        this.isPlaying = true;
+        console.debug(`🎵 Playing: ${track.name} (URI: ${track.uri})`);
         
-        this._updateDuration();
-        this._startProgressUpdates();
+        try {
+            // Zaustavi prijašnju pjesmu ako je bila aktivna
+            if (this.player.get_state(0)[1] !== Gst.State.NULL) {
+                this.player.set_state(Gst.State.NULL);
+            }
+            
+            // Postavi novi URI
+            this.player.set_property('uri', track.uri);
+            
+            // Pokreni playback
+            let stateChange = this.player.set_state(Gst.State.PLAYING);
+            if (stateChange === Gst.StateChangeReturn.FAILURE) {
+                console.error('🎵 Failed to start playback');
+                this._onTrackEnded(); // Pokušaj sljedeću pjesmu
+                return;
+            }
+            
+            this.isPlaying = true;
+            
+            this._updateDuration();
+            this._startProgressUpdates();
+            
+        } catch (e) {
+            console.error(`🎵 Error playing track: ${e.message}`);
+            this._onTrackEnded(); // Pokušaj sljedeću pjesmu
+        }
     }
     
     pause() {
@@ -234,24 +301,40 @@ class MusicPlayer {
     }
     
     next() {
-        this.stop();
+        console.debug('🎵 Next track requested');
+        this.stop(); // Zaustavi trenutnu
         
         let nextTrack = this._findNextEnabledTrack();
         if (nextTrack !== -1) {
             this.currentTrack = nextTrack;
-            this.play();
+            console.debug(`🎵 Next track index: ${nextTrack}`);
+            // Kratki delay da se GStreamer stabilizira
+            let nextTid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+                this._pendingTimeouts = this._pendingTimeouts.filter(id => id !== nextTid);
+                this.play();
+                return GLib.SOURCE_REMOVE;
+            });
+            this._pendingTimeouts.push(nextTid);
         } else {
             console.debug('🎵 No next track available');
         }
     }
     
     previous() {
-        this.stop();
+        console.debug('🎵 Previous track requested');
+        this.stop(); // Zaustavi trenutnu
         
         let prevTrack = this._findPreviousEnabledTrack();
         if (prevTrack !== -1) {
             this.currentTrack = prevTrack;
-            this.play();
+            console.debug(`🎵 Previous track index: ${prevTrack}`);
+            // Kratki delay da se GStreamer stabilizira
+            let prevTid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+                this._pendingTimeouts = this._pendingTimeouts.filter(id => id !== prevTid);
+                this.play();
+                return GLib.SOURCE_REMOVE;
+            });
+            this._pendingTimeouts.push(prevTid);
         } else {
             console.debug('🎵 No previous track available');
         }
@@ -293,7 +376,7 @@ class MusicPlayer {
             }
             // Reshuffle and start over
             this._updateShuffledPlaylist();
-            return this.shuffledPlaylist[0];
+            return this.shuffledPlaylist.length > 0 ? this.shuffledPlaylist[0] : -1;
         }
         
         let startIndex = (this.currentTrack + 1) % this.playlist.length;
@@ -368,6 +451,18 @@ class MusicPlayer {
     destroy() {
         this._stopProgressUpdates();
         
+        // Ukloni sve pending jednoratne timeoute
+        this._pendingTimeouts.forEach(id => GLib.source_remove(id));
+        this._pendingTimeouts = [];
+        
+        // Disconnect bus signal
+        if (this._bus && this._busSignalId) {
+            this._bus.disconnect(this._busSignalId);
+            this._bus.remove_signal_watch();
+            this._busSignalId = null;
+            this._bus = null;
+        }
+        
         if (this.player) {
             this.player.set_state(Gst.State.NULL);
             this.player = null;
@@ -386,6 +481,7 @@ class MusicIndicator extends PanelMenu.Button {
         super._init(0.0, 'MusicAMP Player', false);
         
         this.musicPlayer = musicPlayer;
+        this._signalIds = [];
         
         // Panel icon - zadržavamo znak melodije 🎵
         this._icon = new St.Label({
@@ -431,7 +527,7 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 85px; max-width: 85px; width: 85px; height: 28px; padding: 0px 8px;'
         });
-        this._playButton.connect('clicked', () => {
+        this._signalIds.push([this._playButton, this._playButton.connect('clicked', () => {
             if (this.musicPlayer.isPlaying) {
                 this.musicPlayer.pause();
                 this._playButton.label = '▶️ Play';
@@ -440,7 +536,7 @@ class MusicIndicator extends PanelMenu.Button {
                 this._playButton.label = '⏸️ Pause';
                 this._updateTrackLabel();
             }
-        });
+        })]);
         controlBox.add_child(this._playButton);
 
         // Stop button
@@ -450,11 +546,11 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 80px; max-width: 80px; width: 80px; height: 28px; padding: 0px 8px;'
         });
-        this._stopButton.connect('clicked', () => {
+        this._signalIds.push([this._stopButton, this._stopButton.connect('clicked', () => {
             this.musicPlayer.stop();
             this._playButton.label = '▶️ Play';
             this._updateTrackLabel();
-        });
+        })]);
         controlBox.add_child(this._stopButton);
 
         // Previous button
@@ -464,13 +560,13 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 80px; max-width: 80px; width: 80px; height: 28px; padding: 0px 8px;'
         });
-        prevButton.connect('clicked', () => {
+        this._signalIds.push([prevButton, prevButton.connect('clicked', () => {
             this.musicPlayer.previous();
             if (this.musicPlayer.isPlaying) {
                 this._playButton.label = '⏸️ Pause';
             }
             this._updateTrackLabel();
-        });
+        })]);
         controlBox.add_child(prevButton);
 
         // Next button
@@ -480,13 +576,13 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 80px; max-width: 80px; width: 80px; height: 28px; padding: 0px 8px;'
         });
-        nextButton.connect('clicked', () => {
+        this._signalIds.push([nextButton, nextButton.connect('clicked', () => {
             this.musicPlayer.next();
             if (this.musicPlayer.isPlaying) {
                 this._playButton.label = '⏸️ Pause';
             }
             this._updateTrackLabel();
-        });
+        })]);
         controlBox.add_child(nextButton);
 
         // Mute button
@@ -496,10 +592,10 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 85px; max-width: 85px; width: 85px; height: 28px; padding: 0px 8px;'
         });
-        this._muteButton.connect('clicked', () => {
+        this._signalIds.push([this._muteButton, this._muteButton.connect('clicked', () => {
             this.musicPlayer.toggleMute();
             this._muteButton.label = this.musicPlayer.isMuted ? '🔇 Unmute' : '🔊 Mute';
-        });
+        })]);
         controlBox.add_child(this._muteButton);
 
         // Loop button
@@ -509,7 +605,7 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 110px; max-width: 110px; width: 110px; height: 28px; padding: 0px 8px; color: #4CAF50;'
         });
-        this._loopButton.connect('clicked', () => {
+        this._signalIds.push([this._loopButton, this._loopButton.connect('clicked', () => {
             this.musicPlayer.toggleLoop();
             if (this.musicPlayer.loopEnabled) {
                 this._loopButton.label = '🔁 Loop: ON';
@@ -518,7 +614,7 @@ class MusicIndicator extends PanelMenu.Button {
                 this._loopButton.label = '🔁 Loop: OFF';
                 this._loopButton.style = 'min-width: 95px; max-width: 95px; width: 95px; height: 28px; padding: 0px 8px; color: #888;';
             }
-        });
+        })]);
         controlBox.add_child(this._loopButton);
 
         // Shuffle button (NOVO!)
@@ -528,7 +624,7 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 120px; max-width: 120px; width: 105px; height: 28px; padding: 0px 8px; color: #888;'
         });
-        this._shuffleButton.connect('clicked', () => {
+        this._signalIds.push([this._shuffleButton, this._shuffleButton.connect('clicked', () => {
             this.musicPlayer.toggleShuffle();
             if (this.musicPlayer.shuffleEnabled) {
                 this._shuffleButton.label = '🔀 Shuffle: ON';
@@ -537,7 +633,7 @@ class MusicIndicator extends PanelMenu.Button {
                 this._shuffleButton.label = '🔀 Shuffle: OFF';
                 this._shuffleButton.style = 'min-width: 120px; max-width: 120px; width: 120px; height: 28px; padding: 0px 8px; color: #888;';
             }
-        });
+        })]);
         controlBox.add_child(this._shuffleButton);
         
         let controlItem = new PopupMenu.PopupBaseMenuItem({
@@ -576,9 +672,9 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: true,
             y_align: Clutter.ActorAlign.CENTER
         });
-        this._progressBar.connect('repaint', (area) => {
+        this._signalIds.push([this._progressBar, this._progressBar.connect('repaint', (area) => {
             this._drawProgressBar(area);
-        });
+        })]);
         progressBox.add_child(this._progressBar);
         
         let progressItem = new PopupMenu.PopupBaseMenuItem({
@@ -622,7 +718,7 @@ class MusicIndicator extends PanelMenu.Button {
         
         // Build playlist on first menu open
         let firstOpen = true;
-        this.menu.connect('open-state-changed', (menu, open) => {
+        this._signalIds.push([this.menu, this.menu.connect('open-state-changed', (menu, open) => {
             if (open) {
                 if (firstOpen) {
                     this._buildPlaylistItems();
@@ -630,23 +726,30 @@ class MusicIndicator extends PanelMenu.Button {
                 }
                 this._playlistSection.actor.queue_relayout();
             }
-        });
+        })]);
         
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         
         // Add music file button
         let addFileItem = new PopupMenu.PopupMenuItem('➕ Add Music File...');
-        addFileItem.connect('activate', () => {
+        this._signalIds.push([addFileItem, addFileItem.connect('activate', () => {
             this._openFilePicker();
-        });
+        })]);
         this.menu.addMenuItem(addFileItem);
         
         // Add music folder button
         let addFolderItem = new PopupMenu.PopupMenuItem('📁 Add Music Folder...');
-        addFolderItem.connect('activate', () => {
+        this._signalIds.push([addFolderItem, addFolderItem.connect('activate', () => {
             this._openFolderPicker();
-        });
+        })]);
         this.menu.addMenuItem(addFolderItem);
+
+        // Clear playlist button
+        let clearPlaylistItem = new PopupMenu.PopupMenuItem('🗑️ Clear Playlist');
+        this._signalIds.push([clearPlaylistItem, clearPlaylistItem.connect('activate', () => {
+            this._clearPlaylist();
+        })]);
+        this.menu.addMenuItem(clearPlaylistItem);
     }
     
     _buildPlaylistItems() {
@@ -710,7 +813,7 @@ class MusicIndicator extends PanelMenu.Button {
             let removeButton = new St.Button({
                 label: '✖',
                 style_class: 'button',
-                style: 'padding: 2px 6px; font-size: 10px; color: #ff4444;',
+                style: 'padding: 2px 6px; font-size: 10px; color: #ff8800;',
                 x_expand: false,
                 x_align: Clutter.ActorAlign.END
             });
@@ -889,6 +992,71 @@ class MusicIndicator extends PanelMenu.Button {
             log('Error scanning folder: ' + e.message);
         }
     }
+
+    _clearPlaylist() {
+        // Potvrda korisniku
+        let cmd = [
+            'zenity',
+            '--question',
+            '--title=Clear Playlist',
+            '--text=Are you sure you want to clear the entire playlist?\n\nThis action cannot be undone.',
+            '--width=400'
+        ];
+        
+        try {
+            let proc = Gio.Subprocess.new(
+                cmd,
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    proc.communicate_utf8_finish(res);
+                    
+                    if (proc.get_successful()) {
+                        // Korisnik je potvrdio - brišemo playlistu
+                        log('🎵 Clearing entire playlist');
+                        
+                        // Zaustavi reprodukciju ako je u toku
+                        this.musicPlayer.stop();
+                        
+                        // Isprazni playlistu
+                        this.musicPlayer.playlist = [];
+                        this.musicPlayer.currentTrack = 0;
+                        
+                        // Spremi praznu playlistu
+                        this.musicPlayer.savePlaylist();
+                        
+                        // Update shuffled playlist
+                        this.musicPlayer._updateShuffledPlaylist();
+                        
+                        // Osvježi prikaz playliste
+                        this._buildPlaylistItems();
+                        
+                        // Osvježi prikaz trenutne pjesme
+                        this._updateTrackLabel();
+                        
+                        log('🎵 Playlist cleared');
+                        
+                        // Prikaži obavijest
+                        let notifyCmd = [
+                            'notify-send',
+                            '-i', 'audio-x-generic',
+                            '-t', '3000',
+                            'Playlist cleared',
+                            'All songs have been removed from the playlist.'
+                        ];
+                        Gio.Subprocess.new(notifyCmd, Gio.SubprocessFlags.NONE);
+                    }
+                } catch (e) {
+                    log('Error in confirmation dialog: ' + e.message);
+                }
+            });
+            
+        } catch (e) {
+            log('Error opening confirmation dialog: ' + e.message);
+        }
+    }
     
     _updateProgress() {
         let progress = this.musicPlayer.getProgress();
@@ -950,6 +1118,14 @@ class MusicIndicator extends PanelMenu.Button {
         if (this._progressUpdateId) {
             GLib.source_remove(this._progressUpdateId);
             this._progressUpdateId = null;
+        }
+        
+        // Disconnect svi signali
+        if (this._signalIds) {
+            this._signalIds.forEach(([obj, id]) => {
+                if (obj && id) obj.disconnect(id);
+            });
+            this._signalIds = [];
         }
         
         super.destroy();

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <schemalist>
-  <schema id="org.gnome.shell.extensions.musicamp" path="/org/gnome/shell/extensions/musicamp/">
+  <schema id="musicamp@mdoksa76.github.com" path="/org/gnome/shell/extensions/musicamp/">
     
     <key name="loop-enabled" type="b">
       <default>true</default>
