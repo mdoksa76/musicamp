@@ -26,7 +26,9 @@ class MusicPlayer {
         this.shuffleEnabled = this.settings.get_boolean('shuffle-enabled');
         this.volume = this.settings.get_double('volume');
         
-        this.playlist = [];
+        this.tabs = [];
+        this.activeTab = 0;      // tab koji korisnik trenutno GLEDA
+        this.playingTab = 0;     // tab iz kojeg se stvarno REPRODUCIRA
         this.shuffledPlaylist = [];
         
         this.duration = 0;
@@ -38,6 +40,26 @@ class MusicPlayer {
         this._loadPlaylist();
     }
     
+    // playlist = pjesme taba koji SVIRA (koriste play/next/prev/onTrackEnded/progress).
+    get playlist() {
+        if (this.playingTab < 0 || this.playingTab >= this.tabs.length) return [];
+        return this.tabs[this.playingTab].tracks;
+    }
+    set playlist(tracks) {
+        if (this.playingTab < 0 || this.playingTab >= this.tabs.length) return;
+        this.tabs[this.playingTab].tracks = tracks;
+    }
+
+    // viewTracks = pjesme taba koji korisnik GLEDA (koristi UI za popis/uređivanje).
+    get viewTracks() {
+        if (this.activeTab < 0 || this.activeTab >= this.tabs.length) return [];
+        return this.tabs[this.activeTab].tracks;
+    }
+    set viewTracks(tracks) {
+        if (this.activeTab < 0 || this.activeTab >= this.tabs.length) return;
+        this.tabs[this.activeTab].tracks = tracks;
+    }
+
     _initPlayer() {
         if (!Gst.is_initialized()) {
             Gst.init(null);
@@ -89,38 +111,114 @@ class MusicPlayer {
     }
     
     _loadPlaylist() {
-        this.playlist = [];
-        
+        this.tabs = [];
+        this.activeTab = 0;
+
         let playlistJson = this.settings.get_string('music-playlist');
-        if (playlistJson && playlistJson !== '[]') {
+        if (playlistJson && playlistJson !== '[]' && playlistJson !== '') {
             try {
-                let savedTracks = JSON.parse(playlistJson);
-                savedTracks.forEach(track => {
-                    this.playlist.push({
-                        name: track.name,
-                        uri: track.uri,
-                        enabled: track.enabled !== false
+                let parsed = JSON.parse(playlistJson);
+
+                if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].tracks !== undefined) {
+                    // Novi format: niz tabova
+                    parsed.forEach(tab => {
+                        this.tabs.push({
+                            name: tab.name || 'Playlist',
+                            tracks: (tab.tracks || []).map(track => ({
+                                name: track.name,
+                                uri: track.uri,
+                                enabled: track.enabled !== false
+                            }))
+                        });
                     });
-                });
+                } else if (Array.isArray(parsed)) {
+                    // Stari format: goli niz pjesama -> zamotaj u tab 0
+                    this.tabs.push({
+                        name: 'Playlist',
+                        tracks: parsed.map(track => ({
+                            name: track.name,
+                            uri: track.uri,
+                            enabled: track.enabled !== false
+                        }))
+                    });
+                }
             } catch (e) {
                 console.error('🎵 Error loading playlist: ' + e.message);
             }
         }
-        
+
+        // Tab 0 je trajni default - uvijek postoji
+        if (this.tabs.length === 0) {
+            this.tabs.push({ name: 'Playlist', tracks: [] });
+        }
+
         this._updateShuffledPlaylist();
-        console.debug(`🎵 Playlist loaded: ${this.playlist.length} songs`);
+        console.debug(`🎵 Loaded ${this.tabs.length} tab(s), active tab has ${this.playlist.length} songs`);
     }
-    
+
     savePlaylist() {
-        let allTracks = this.playlist.map(track => ({
-            name: track.name,
-            uri: track.uri,
-            enabled: track.enabled
+        let allTabs = this.tabs.map(tab => ({
+            name: tab.name,
+            tracks: tab.tracks.map(track => ({
+                name: track.name,
+                uri: track.uri,
+                enabled: track.enabled
+            }))
         }));
-        
-        let playlistJson = JSON.stringify(allTracks);
+
+        let playlistJson = JSON.stringify(allTabs);
         this.settings.set_string('music-playlist', playlistJson);
         console.debug('🎵 Playlist saved');
+    }
+
+    // --- Tab upravljanje ---
+    addTab(name) {
+        this.tabs.push({ name: name || `Tab ${this.tabs.length + 1}`, tracks: [] });
+        this.activeTab = this.tabs.length - 1;
+        this.savePlaylist();
+        console.debug(`🎵 Tab added: ${name}`);
+    }
+
+    removeTab(index) {
+        // Tab 0 je trajni default - ne briše se
+        if (index <= 0 || index >= this.tabs.length) return;
+
+        // Zaustavi reprodukciju samo ako brišemo tab koji svira
+        let removingPlayingTab = (index === this.playingTab);
+        if (removingPlayingTab) {
+            this.stop();
+            this.currentTrack = 0;
+        }
+
+        this.tabs.splice(index, 1);
+
+        // Pomakni activeTab (gledani)
+        if (this.activeTab >= this.tabs.length) {
+            this.activeTab = this.tabs.length - 1;
+        } else if (this.activeTab === index) {
+            this.activeTab = Math.max(0, index - 1);
+        } else if (this.activeTab > index) {
+            this.activeTab--;
+        }
+
+        // Pomakni playingTab da ostane valjan
+        if (removingPlayingTab) {
+            this.playingTab = this.activeTab;
+        } else if (this.playingTab > index) {
+            this.playingTab--;
+        }
+
+        this._updateShuffledPlaylist();
+        this.savePlaylist();
+        console.debug(`🎵 Tab removed: ${index}`);
+    }
+
+    switchTab(index) {
+        if (index < 0 || index >= this.tabs.length) return;
+        if (index === this.activeTab) return;
+        // Samo mijenjamo GLEDANI tab - reprodukcija iz playingTab se ne prekida.
+        this.activeTab = index;
+        console.debug(`🎵 Viewing tab: ${this.tabs[index].name}`);
     }
     
     _updateShuffledPlaylist() {
@@ -282,6 +380,27 @@ class MusicPlayer {
         }
     }
     
+    playTrack(index) {
+        // Klik na pjesmu u gledanom tabu -> reprodukcija prelazi na taj tab.
+        if (this.playingTab !== this.activeTab) {
+            this.playingTab = this.activeTab;
+            this._updateShuffledPlaylist();
+        }
+        if (index < 0 || index >= this.playlist.length) return;
+        if (!this.playlist[index].enabled) return;
+
+        console.debug(`🎵 Play track requested: ${index} (tab ${this.playingTab})`);
+        this.stop();
+        this.currentTrack = index;
+
+        let tid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+            this._pendingTimeouts = this._pendingTimeouts.filter(id => id !== tid);
+            this.play();
+            return GLib.SOURCE_REMOVE;
+        });
+        this._pendingTimeouts.push(tid);
+    }
+
     pause() {
         if (!this.player) return;
         
@@ -428,12 +547,13 @@ class MusicPlayer {
     }
     
     removeTrack(index) {
-        if (index < 0 || index >= this.playlist.length) return;
+        if (index < 0 || index >= this.viewTracks.length) return;
         
-        console.debug(`🎵 Removing: ${this.playlist[index].name}`);
-        this.playlist.splice(index, 1);
+        console.debug(`🎵 Removing: ${this.viewTracks[index].name}`);
+        this.viewTracks.splice(index, 1);
         
-        if (this.currentTrack >= index) {
+        // currentTrack pripada tabu koji svira - prilagodi samo ako gledamo taj tab
+        if (this.activeTab === this.playingTab && this.currentTrack >= index) {
             this.currentTrack = Math.max(0, this.currentTrack - 1);
         }
         
@@ -481,7 +601,6 @@ class MusicIndicator extends PanelMenu.Button {
         super._init(0.0, 'MusicAMP Player', false);
         
         this.musicPlayer = musicPlayer;
-        this._signalIds = [];
         
         // Panel icon - zadržavamo znak melodije 🎵
         this._icon = new St.Label({
@@ -527,7 +646,7 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 85px; max-width: 85px; width: 85px; height: 28px; padding: 0px 8px;'
         });
-        this._signalIds.push([this._playButton, this._playButton.connect('clicked', () => {
+        this._playButton.connectObject('clicked', () => {
             if (this.musicPlayer.isPlaying) {
                 this.musicPlayer.pause();
                 this._playButton.label = '▶️ Play';
@@ -536,7 +655,7 @@ class MusicIndicator extends PanelMenu.Button {
                 this._playButton.label = '⏸️ Pause';
                 this._updateTrackLabel();
             }
-        })]);
+        }, this);
         controlBox.add_child(this._playButton);
 
         // Stop button
@@ -546,11 +665,11 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 80px; max-width: 80px; width: 80px; height: 28px; padding: 0px 8px;'
         });
-        this._signalIds.push([this._stopButton, this._stopButton.connect('clicked', () => {
+        this._stopButton.connectObject('clicked', () => {
             this.musicPlayer.stop();
             this._playButton.label = '▶️ Play';
             this._updateTrackLabel();
-        })]);
+        }, this);
         controlBox.add_child(this._stopButton);
 
         // Previous button
@@ -560,13 +679,13 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 80px; max-width: 80px; width: 80px; height: 28px; padding: 0px 8px;'
         });
-        this._signalIds.push([prevButton, prevButton.connect('clicked', () => {
+        prevButton.connectObject('clicked', () => {
             this.musicPlayer.previous();
             if (this.musicPlayer.isPlaying) {
                 this._playButton.label = '⏸️ Pause';
             }
             this._updateTrackLabel();
-        })]);
+        }, this);
         controlBox.add_child(prevButton);
 
         // Next button
@@ -576,13 +695,13 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 80px; max-width: 80px; width: 80px; height: 28px; padding: 0px 8px;'
         });
-        this._signalIds.push([nextButton, nextButton.connect('clicked', () => {
+        nextButton.connectObject('clicked', () => {
             this.musicPlayer.next();
             if (this.musicPlayer.isPlaying) {
                 this._playButton.label = '⏸️ Pause';
             }
             this._updateTrackLabel();
-        })]);
+        }, this);
         controlBox.add_child(nextButton);
 
         // Mute button
@@ -592,10 +711,10 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 85px; max-width: 85px; width: 85px; height: 28px; padding: 0px 8px;'
         });
-        this._signalIds.push([this._muteButton, this._muteButton.connect('clicked', () => {
+        this._muteButton.connectObject('clicked', () => {
             this.musicPlayer.toggleMute();
             this._muteButton.label = this.musicPlayer.isMuted ? '🔇 Unmute' : '🔊 Mute';
-        })]);
+        }, this);
         controlBox.add_child(this._muteButton);
 
         // Loop button
@@ -605,7 +724,7 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 110px; max-width: 110px; width: 110px; height: 28px; padding: 0px 8px; color: #4CAF50;'
         });
-        this._signalIds.push([this._loopButton, this._loopButton.connect('clicked', () => {
+        this._loopButton.connectObject('clicked', () => {
             this.musicPlayer.toggleLoop();
             if (this.musicPlayer.loopEnabled) {
                 this._loopButton.label = '🔁 Loop: ON';
@@ -614,7 +733,7 @@ class MusicIndicator extends PanelMenu.Button {
                 this._loopButton.label = '🔁 Loop: OFF';
                 this._loopButton.style = 'min-width: 95px; max-width: 95px; width: 95px; height: 28px; padding: 0px 8px; color: #888;';
             }
-        })]);
+        }, this);
         controlBox.add_child(this._loopButton);
 
         // Shuffle button (NOVO!)
@@ -624,7 +743,7 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: false,
             style: 'min-width: 120px; max-width: 120px; width: 105px; height: 28px; padding: 0px 8px; color: #888;'
         });
-        this._signalIds.push([this._shuffleButton, this._shuffleButton.connect('clicked', () => {
+        this._shuffleButton.connectObject('clicked', () => {
             this.musicPlayer.toggleShuffle();
             if (this.musicPlayer.shuffleEnabled) {
                 this._shuffleButton.label = '🔀 Shuffle: ON';
@@ -633,7 +752,7 @@ class MusicIndicator extends PanelMenu.Button {
                 this._shuffleButton.label = '🔀 Shuffle: OFF';
                 this._shuffleButton.style = 'min-width: 120px; max-width: 120px; width: 120px; height: 28px; padding: 0px 8px; color: #888;';
             }
-        })]);
+        }, this);
         controlBox.add_child(this._shuffleButton);
         
         let controlItem = new PopupMenu.PopupBaseMenuItem({
@@ -642,6 +761,7 @@ class MusicIndicator extends PanelMenu.Button {
         });
         controlItem.actor.add_child(controlBox);
         this.menu.addMenuItem(controlItem);
+        this._controlBox = controlBox;
         
         // Progress bar - HORIZONTAL sa vremenom
         let progressBox = new St.BoxLayout({
@@ -672,9 +792,9 @@ class MusicIndicator extends PanelMenu.Button {
             x_expand: true,
             y_align: Clutter.ActorAlign.CENTER
         });
-        this._signalIds.push([this._progressBar, this._progressBar.connect('repaint', (area) => {
+        this._progressBar.connectObject('repaint', (area) => {
             this._drawProgressBar(area);
-        })]);
+        }, this);
         progressBox.add_child(this._progressBar);
         
         let progressItem = new PopupMenu.PopupBaseMenuItem({
@@ -692,6 +812,30 @@ class MusicIndicator extends PanelMenu.Button {
         
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         
+        // Tab row (iznad playliste) - horizontalni scroll kad tabova ima previše
+        this._tabsItem = new PopupMenu.PopupBaseMenuItem({
+            reactive: false,
+            can_focus: false
+        });
+        this._tabsBox = new St.BoxLayout({
+            style: 'spacing: 4px; padding: 2px 0px;',
+            x_expand: false,
+            x_align: Clutter.ActorAlign.START,
+            vertical: false
+        });
+        let tabsScroll = new St.ScrollView({
+            hscrollbar_policy: St.PolicyType.AUTOMATIC,
+            vscrollbar_policy: St.PolicyType.NEVER,
+            x_expand: true,
+            x_align: Clutter.ActorAlign.FILL,
+            clip_to_allocation: true,
+            style: 'max-height: 40px;'
+        });
+        tabsScroll.add_child(this._tabsBox);
+        this._tabsItem.actor.add_child(tabsScroll);
+        this.menu.addMenuItem(this._tabsItem);
+        this._tabsScroll = tabsScroll;
+
         // Playlist section
         let playlistLabel = new PopupMenu.PopupMenuItem('📋 Playlist:', {
             reactive: false,
@@ -718,38 +862,178 @@ class MusicIndicator extends PanelMenu.Button {
         
         // Build playlist on first menu open
         let firstOpen = true;
-        this._signalIds.push([this.menu, this.menu.connect('open-state-changed', (menu, open) => {
+        this.menu.connectObject('open-state-changed', (menu, open) => {
             if (open) {
                 if (firstOpen) {
+                    this._buildTabs();
                     this._buildPlaylistItems();
                     firstOpen = false;
                 }
                 this._playlistSection.actor.queue_relayout();
+
+                // Ograniči širinu tab-scrolla na stvarnu širinu reda kontrola,
+                // da dodavanje tabova ne širi meni nego aktivira h-scroll.
+                this._refreshTabsWidth();
             }
-        })]);
+        }, this);
         
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         
         // Add music file button
         let addFileItem = new PopupMenu.PopupMenuItem('➕ Add Music File...');
-        this._signalIds.push([addFileItem, addFileItem.connect('activate', () => {
+        addFileItem.connectObject('activate', () => {
             this._openFilePicker();
-        })]);
+        }, this);
         this.menu.addMenuItem(addFileItem);
         
         // Add music folder button
         let addFolderItem = new PopupMenu.PopupMenuItem('📁 Add Music Folder...');
-        this._signalIds.push([addFolderItem, addFolderItem.connect('activate', () => {
+        addFolderItem.connectObject('activate', () => {
             this._openFolderPicker();
-        })]);
+        }, this);
         this.menu.addMenuItem(addFolderItem);
+
+        // Add Tab button
+        let addTabItem = new PopupMenu.PopupMenuItem('🗂️ Add Tab...');
+        addTabItem.connectObject('activate', () => {
+            this._addTab();
+        }, this);
+        this.menu.addMenuItem(addTabItem);
 
         // Clear playlist button
         let clearPlaylistItem = new PopupMenu.PopupMenuItem('🗑️ Clear Playlist');
-        this._signalIds.push([clearPlaylistItem, clearPlaylistItem.connect('activate', () => {
+        clearPlaylistItem.connectObject('activate', () => {
             this._clearPlaylist();
-        })]);
+        }, this);
         this.menu.addMenuItem(clearPlaylistItem);
+    }
+
+    _buildTabs() {
+        this._tabsBox.destroy_all_children();
+
+        this.musicPlayer.tabs.forEach((tab, index) => {
+            let isActive = (index === this.musicPlayer.activeTab);
+            let minW = Math.max(50, tab.name.length * 8 + 24);
+            let tabBtn = new St.Button({
+                label: tab.name,
+                style_class: 'button',
+                x_expand: false,
+                style: (isActive
+                    ? 'padding: 2px 10px; height: 26px; color: #FF8800; font-weight: bold;'
+                    : 'padding: 2px 10px; height: 26px; color: #ccc;')
+                    + ` min-width: ${minW}px;`
+            });
+            tabBtn.connect('clicked', () => {
+                this.musicPlayer.switchTab(index);
+                this._buildTabs();
+                this._buildPlaylistItems();
+                // Reprodukcija se ne prekida - gumb odražava stvarno stanje
+                this._playButton.label = this.musicPlayer.isPlaying ? '⏸️ Pause' : '▶️ Play';
+                this._updateTrackLabel();
+            });
+            this._tabsBox.add_child(tabBtn);
+
+            // Tabovi 1+ imaju gumb za brisanje; tab 0 (default) nema
+            if (index > 0) {
+                let delBtn = new St.Button({
+                    label: '✖',
+                    style_class: 'button',
+                    x_expand: false,
+                    style: 'padding: 2px 4px; height: 26px; min-width: 22px; max-width: 22px; font-size: 9px; color: #ff5555;'
+                });
+                delBtn.connect('clicked', () => {
+                    this._removeTab(index);
+                });
+                this._tabsBox.add_child(delBtn);
+            }
+        });
+        this._refreshTabsWidth();
+    }
+
+    // Premjeri i primijeni širinu tab-scrolla na temelju reda kontrola.
+    // Zove se nakon svake promjene tabova (dodaj/obriši/switch), ne samo na otvaranju.
+    _refreshTabsWidth() {
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+            if (this._controlBox && this._tabsScroll) {
+                // Širina reda kontrola je konstanta (fiksni gumbi). Izmjeri je
+                // JEDNOM i zaključaj - inače premjeravanje pri brisanju tabova
+                // hvata prijelazne (manje) vrijednosti i linija se skraćuje.
+                if (!this._lockedTabsWidth) {
+                    let w = this._controlBox.get_width();
+                    if (w > 0) this._lockedTabsWidth = w;
+                }
+                if (this._lockedTabsWidth) {
+                    this._tabsScroll.style = `max-width: ${this._lockedTabsWidth}px; max-height: 40px;`;
+                }
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _addTab() {
+        let cmd = [
+            'zenity', '--entry',
+            '--title=Add Tab',
+            '--text=Tab name:',
+            '--width=350'
+        ];
+        try {
+            let proc = Gio.Subprocess.new(
+                cmd,
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    let [, stdout] = proc.communicate_utf8_finish(res);
+                    if (proc.get_successful() && stdout) {
+                        let name = stdout.trim();
+                        if (name.length > 0) {
+                            this.musicPlayer.addTab(name);
+                            this._buildTabs();
+                            this._buildPlaylistItems();
+                            this._playButton.label = '▶️ Play';
+                            this._updateTrackLabel();
+                        }
+                    }
+                } catch (e) {
+                    log('Error reading tab name: ' + e.message);
+                }
+            });
+        } catch (e) {
+            log('Error opening tab name dialog: ' + e.message);
+        }
+    }
+
+    _removeTab(index) {
+        let tabName = this.musicPlayer.tabs[index]?.name || '';
+        let cmd = [
+            'zenity', '--question',
+            '--title=Remove Tab',
+            `--text=Remove tab "${tabName}" and all its songs?`,
+            '--width=400'
+        ];
+        try {
+            let proc = Gio.Subprocess.new(
+                cmd,
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    proc.communicate_utf8_finish(res);
+                    if (proc.get_successful()) {
+                        this.musicPlayer.removeTab(index);
+                        this._buildTabs();
+                        this._buildPlaylistItems();
+                        this._playButton.label = '▶️ Play';
+                        this._updateTrackLabel();
+                    }
+                } catch (e) {
+                    log('Error in remove tab dialog: ' + e.message);
+                }
+            });
+        } catch (e) {
+            log('Error opening remove tab dialog: ' + e.message);
+        }
     }
     
     _buildPlaylistItems() {
@@ -761,8 +1045,8 @@ class MusicIndicator extends PanelMenu.Button {
         
         this._playlistSection.removeAll();
         
-        // Add each track with checkbox and remove button
-        this.musicPlayer.playlist.forEach((track, index) => {
+        // Add each track with checkbox and remove button (iz GLEDANOG taba)
+        this.musicPlayer.viewTracks.forEach((track, index) => {
             let rowBox = new St.BoxLayout({
                 style: 'spacing: 8px; padding: 2px 0px; min-width: 750px;',
                 x_expand: true,
@@ -784,7 +1068,7 @@ class MusicIndicator extends PanelMenu.Button {
             
             checkbox.connect('clicked', () => {
                 track.enabled = !track.enabled;
-                this.musicPlayer.playlist[index].enabled = track.enabled;
+                this.musicPlayer.viewTracks[index].enabled = track.enabled;
                 
                 if (track.enabled) {
                     checkbox.add_style_class_name('toggle-on');
@@ -799,13 +1083,18 @@ class MusicIndicator extends PanelMenu.Button {
             
             rowBox.add_child(checkbox);
             
-            // Track name
-            let nameLabel = new St.Label({
-                text: track.name,
-                y_align: Clutter.ActorAlign.CENTER,
+            // Track name - klikabilno za pokretanje pjesme (izgled kao obični sivi label)
+            let nameLabel = new St.Button({
+                label: track.name,
                 x_expand: true,
                 x_align: Clutter.ActorAlign.START,
-                style: 'padding-left: 8px;'
+                style: 'padding-left: 8px; background: none; border: none; box-shadow: none; font-weight: normal;'
+            });
+            nameLabel.connect('clicked', () => {
+                this.musicPlayer.playTrack(index);
+                this._playButton.label = '⏸️ Pause';
+                this._buildPlaylistItems();
+                this._updateTrackLabel();
             });
             rowBox.add_child(nameLabel);
             
@@ -834,7 +1123,7 @@ class MusicIndicator extends PanelMenu.Button {
             this._playlistItems.push(rowItem);
         });
         
-        if (this.musicPlayer.playlist.length === 0) {
+        if (this.musicPlayer.viewTracks.length === 0) {
             let emptyItem = new PopupMenu.PopupMenuItem('(No tracks in playlist)', {
                 reactive: false,
                 can_focus: false
@@ -891,7 +1180,7 @@ class MusicIndicator extends PanelMenu.Button {
         let fileName = filePath.split('/').pop();
         let fileUri = `file://${filePath}`;
         
-        this.musicPlayer.playlist.push({
+        this.musicPlayer.viewTracks.push({
             name: fileName,
             uri: fileUri,
             enabled: true
@@ -1014,17 +1303,19 @@ class MusicIndicator extends PanelMenu.Button {
                     proc.communicate_utf8_finish(res);
                     
                     if (proc.get_successful()) {
-                        // Korisnik je potvrdio - brišemo playlistu
-                        log('🎵 Clearing entire playlist');
+                        // Korisnik je potvrdio - brišemo playlistu GLEDANOG taba
+                        log('🎵 Clearing viewed tab playlist');
                         
-                        // Zaustavi reprodukciju ako je u toku
-                        this.musicPlayer.stop();
+                        // Zaustavi samo ako gledani tab je onaj koji svira
+                        if (this.musicPlayer.activeTab === this.musicPlayer.playingTab) {
+                            this.musicPlayer.stop();
+                            this.musicPlayer.currentTrack = 0;
+                        }
                         
-                        // Isprazni playlistu
-                        this.musicPlayer.playlist = [];
-                        this.musicPlayer.currentTrack = 0;
+                        // Isprazni GLEDANI tab
+                        this.musicPlayer.viewTracks = [];
                         
-                        // Spremi praznu playlistu
+                        // Spremi
                         this.musicPlayer.savePlaylist();
                         
                         // Update shuffled playlist
@@ -1120,13 +1411,12 @@ class MusicIndicator extends PanelMenu.Button {
             this._progressUpdateId = null;
         }
         
-        // Disconnect svi signali
-        if (this._signalIds) {
-            this._signalIds.forEach(([obj, id]) => {
-                if (obj && id) obj.disconnect(id);
-            });
-            this._signalIds = [];
-        }
+        // Disconnect svi signali registrirani s connectObject
+        [
+            this._playButton, this._stopButton, this._muteButton,
+            this._loopButton, this._shuffleButton, this._progressBar,
+            this.menu
+        ].forEach(obj => { if (obj) obj.disconnectObject(this); });
         
         super.destroy();
     }
